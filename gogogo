@@ -1,0 +1,128 @@
+package main
+
+import (
+    "fmt"
+    "log"
+
+    "github.com/miekg/pkcs11"
+)
+
+func main() {
+    // Load PKCS#11 module
+    p := pkcs11.New("D:\\SoftHSM2\\lib\\softhsm2-x64.dll")
+    if err := p.Initialize(); err != nil {
+		log.Println ("1")
+        log.Fatal(err)
+    }
+    defer p.Finalize()
+
+    // Get first slot with token
+    slots, err := p.GetSlotList(true)
+    if err != nil {
+		log.Println ("2")
+        log.Fatal(err)
+    }
+	log.Println (slots)
+    session, err := p.OpenSession(slots[0], pkcs11.CKF_SERIAL_SESSION|pkcs11.CKF_RW_SESSION)
+    if err != nil {
+		log.Println ("3")
+        log.Fatal(err)
+    }
+    defer p.CloseSession(session)
+
+    // Login
+    err = p.Login(session, pkcs11.CKU_USER, "1111") // thay bằng PIN của bạn
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer p.Logout(session)
+
+    // ----------------------------
+    // Step 1: Tạo ROOT KEY (AES-256)
+    // ----------------------------
+    rootKeyTemplate := []*pkcs11.Attribute{
+        pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_SECRET_KEY),
+        pkcs11.NewAttribute(pkcs11.CKA_KEY_TYPE, pkcs11.CKK_AES),
+        pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
+        pkcs11.NewAttribute(pkcs11.CKA_LABEL, "RootKey"),
+        pkcs11.NewAttribute(pkcs11.CKA_VALUE_LEN, 32), // 256-bit
+        pkcs11.NewAttribute(pkcs11.CKA_WRAP, true),
+        pkcs11.NewAttribute(pkcs11.CKA_UNWRAP, true),
+    }
+
+    rootKeyHandle, err := p.GenerateKey(session, []*pkcs11.Mechanism{
+        pkcs11.NewMechanism(pkcs11.CKM_AES_KEY_GEN, nil),
+    }, rootKeyTemplate)
+    if err != nil {
+        log.Fatalf("Tạo RootKey lỗi: %v", err)
+    }
+
+    fmt.Println("✅ RootKey created")
+
+    // ----------------------------
+    // Step 2: Tạo DEK trong HSM
+    // ----------------------------
+    dekTemplate := []*pkcs11.Attribute{
+        pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_SECRET_KEY),
+        pkcs11.NewAttribute(pkcs11.CKA_KEY_TYPE, pkcs11.CKK_AES),
+        pkcs11.NewAttribute(pkcs11.CKA_VALUE_LEN, 32), // 256-bit
+        pkcs11.NewAttribute(pkcs11.CKA_ENCRYPT, true),
+        pkcs11.NewAttribute(pkcs11.CKA_DECRYPT, true),
+        pkcs11.NewAttribute(pkcs11.CKA_TOKEN, false),
+
+		pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, true),
+		 // DEK tạm thời
+    }
+
+    dekHandle, err := p.GenerateKey(session, []*pkcs11.Mechanism{
+        pkcs11.NewMechanism(pkcs11.CKM_AES_KEY_GEN, nil),
+    }, dekTemplate)
+    if err != nil {
+        log.Fatalf("Tạo DEK lỗi: %v", err)
+    }
+
+    fmt.Println("✅ DEK created")
+
+    // ----------------------------
+    // Step 3: Wrap DEK bằng RootKey
+    // ----------------------------
+    mech := pkcs11.NewMechanism(pkcs11.CKM_AES_KEY_WRAP_PAD, nil)
+
+    wrappedKey, err := p.WrapKey(session, []*pkcs11.Mechanism{mech}, rootKeyHandle, dekHandle)
+    if err != nil {
+        log.Fatalf("❌ WrapKey lỗi: %v", err)
+    }
+
+    fmt.Printf("✅ DEK đã wrap (%d bytes)\n", len(wrappedKey))
+
+    // ----------------------------
+    // Step 4: Unwrap DEK và lưu lại trong HSM
+    // ----------------------------
+    unwrapTemplate := []*pkcs11.Attribute{
+        pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_SECRET_KEY),
+        pkcs11.NewAttribute(pkcs11.CKA_KEY_TYPE, pkcs11.CKK_AES),
+        pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
+        pkcs11.NewAttribute(pkcs11.CKA_ENCRYPT, true),
+        pkcs11.NewAttribute(pkcs11.CKA_DECRYPT, true),
+		pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, false),
+        pkcs11.NewAttribute(pkcs11.CKA_LABEL, "UnwrappedDEK"),
+    }
+
+    unwrappedHandle, err := p.UnwrapKey(session, []*pkcs11.Mechanism{mech}, rootKeyHandle, wrappedKey, unwrapTemplate)
+    if err != nil {
+        log.Fatalf("❌ UnwrapKey lỗi: %v", err)
+    }
+
+    fmt.Println("✅ DEK unwrapped thành công! Handle:", unwrappedHandle)
+
+	attrs := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_VALUE, nil),
+	}
+	attrs, err = p.GetAttributeValue(session, unwrappedHandle, attrs)
+	if err != nil {
+		log.Fatalf("Lấy giá trị rõ key lỗi: %v", err)
+	}
+	
+	clearKey := attrs[0].Value
+	fmt.Printf("Clear key bytes: %x\n", clearKey)
+}
